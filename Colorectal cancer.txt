@@ -1,0 +1,448 @@
+﻿import os
+import random
+import cv2
+import numpy as np
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    import torch.optim as optim
+    from torch.utils.data import Dataset, DataLoader
+    from torch.amp import GradScaler, autocast
+    from torch.optim.lr_scheduler import CosineAnnealingLR
+except ImportError as e:
+    raise ImportError(f"Failed to import PyTorch: {e}. Please run: !pip install torch==2.3.0 torchvision==0.18.0 --index-url https://download.pytorch.org/whl/cu118")
+try:
+    from torchvision import models
+    import albumentations as A
+    from albumentations.pytorch import ToTensorV2
+    from sklearn.metrics import precision_recall_fscore_support, roc_auc_score, confusion_matrix
+except ImportError as e:
+    raise ImportError(f"Failed to import dependencies: {e}. Please run: !pip install torchvision albumentations scikit-learn")
+import matplotlib.pyplot as plt
+import kagglehub
+
+# Set random seed for reproducibility
+random.seed(42)
+torch.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(42)
+
+# --- Dataset Download and Setup ---
+print("Downloading dataset...")
+try:
+    dataset_path = kagglehub.dataset_download("debeshjha1/kvasirseg")
+    print(f"Dataset downloaded to: {dataset_path}")
+except Exception as e:
+    raise Exception(f"Failed to download dataset: {e}")
+
+# Find the actual image and mask directories
+def find_dataset_dirs(base_path):
+    for root, dirs, files in os.walk(base_path):
+        if 'images' in dirs and 'masks' in dirs:
+            return os.path.join(root, 'images'), os.path.join(root, 'masks')
+        if 'Kvasir-SEG' in dirs:
+            return find_dataset_dirs(os.path.join(root, 'Kvasir-SEG'))
+    return None, None
+
+image_dir, mask_dir = find_dataset_dirs(dataset_path)
+
+if image_dir is None or mask_dir is None:
+    for root, dirs, files in os.walk(dataset_path):
+        if 'images' in dirs:
+            image_dir = os.path.join(root, 'images')
+        if 'masks' in dirs:
+            mask_dir = os.path.join(root, 'masks')
+
+# Final verification
+if not os.path.exists(image_dir) or not os.path.exists(mask_dir):
+    raise FileNotFoundError(f"Could not locate images or masks directories in {dataset_path}")
+
+print(f"Found images at: {image_dir}")
+print(f"Found masks at: {mask_dir}")
+image_count = len(os.listdir(image_dir))
+mask_count = len(os.listdir(mask_dir))
+print(f"Number of images: {image_count}")
+print(f"Number of masks: {mask_count}")
+
+# --- Dataset Class ---
+class PolypDataset(Dataset):
+    def __init__(self, image_paths, mask_paths, augment=False):
+        self.image_paths = image_paths
+        self.mask_paths = mask_paths
+        self.augment = augment
+        self.transform = A.Compose([
+            A.Resize(352, 352),
+            A.HorizontalFlip(p=0.5),
+            A.VerticalFlip(p=0.5),
+            A.RandomRotate90(p=0.5),
+            A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.3),
+            A.ElasticTransform(alpha=120, sigma=120 * 0.05, p=0.2),
+            A.GaussNoise(p=0.2),
+            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            ToTensorV2(),
+        ]) if augment else A.Compose([
+            A.Resize(352, 352),
+            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            ToTensorV2(),
+        ])
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, idx):
+        try:
+            img = cv2.imread(self.image_paths[idx])
+            if img is None:
+                raise ValueError(f"Failed to load image: {self.image_paths[idx]}")
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            mask = cv2.imread(self.mask_paths[idx], cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                raise ValueError(f"Failed to load mask: {self.mask_paths[idx]}")
+        except Exception as e:
+            raise Exception(f"Error loading data at index {idx}: {e}")
+
+        augmented = self.transform(image=img, mask=mask)
+        img = augmented['image']
+        mask = augmented['mask'].unsqueeze(0) / 255.0
+        return img, mask
+
+# --- Reverse Attention Module ---
+class ReverseAttention(nn.Module):
+    def __init__(self, in_channels, out_channels, guidance_channels):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(0.2),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+        self.guidance_conv = nn.Conv2d(guidance_channels, in_channels, 1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x, guidance):
+        guidance = self.guidance_conv(guidance)
+        guidance = F.interpolate(guidance, size=x.size()[2:], mode='bilinear', align_corners=True)
+        guidance = self.sigmoid(guidance)
+        reverse = 1 - guidance
+        x = x * reverse
+        return self.conv(x)
+
+# --- PraNet Architecture ---
+class PraNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        resnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+        self.layer0 = nn.Sequential(resnet.conv1, resnet.bn1, resnet.relu)
+        self.layer1 = nn.Sequential(resnet.maxpool, resnet.layer1)
+        self.layer2 = resnet.layer2
+        self.layer3 = resnet.layer3
+        self.layer4 = resnet.layer4
+
+        self.ra4 = ReverseAttention(2048, 512, guidance_channels=2048)
+        self.ra3 = ReverseAttention(1024, 256, guidance_channels=512)
+        self.ra2 = ReverseAttention(512, 64, guidance_channels=256)
+        self.final = nn.Conv2d(64, 1, 1)
+
+    def forward(self, x):
+        x0 = self.layer0(x)
+        x1 = self.layer1(x0)
+        x2 = self.layer2(x1)
+        x3 = self.layer3(x2)
+        x4 = self.layer4(x3)
+
+        ra4_feat = self.ra4(x4, x4)
+        ra3_feat = self.ra3(x3, ra4_feat)
+        ra2_feat = self.ra2(x2, ra3_feat)
+        out = self.final(ra2_feat)
+        out = F.interpolate(out, size=(352, 352), mode='bilinear', align_corners=True)
+        return out
+
+# --- Custom BCEWithLogitsLoss with Label Smoothing ---
+class BCEWithLogitsLossWithSmoothing(nn.Module):
+    def __init__(self, label_smoothing=0.1):
+        super().__init__()
+        self.label_smoothing = label_smoothing
+        self.smooth = 1e-6
+
+    def forward(self, input, target):
+        target_smooth = target * (1 - self.label_smoothing) + 0.5 * self.label_smoothing
+        return F.binary_cross_entropy_with_logits(input, target_smooth)
+
+# --- Combined BCE + Dice Loss ---
+class CombinedLoss(nn.Module):
+    def __init__(self, label_smoothing=0.1):
+        super().__init__()
+        self.bce = BCEWithLogitsLossWithSmoothing(label_smoothing=label_smoothing)
+        self.smooth = 1e-6
+
+    def dice_loss(self, preds, targets):
+        preds = torch.sigmoid(preds)
+        intersection = (preds * targets).sum()
+        union = preds.sum() + targets.sum()
+        return 1 - (2.0 * intersection + self.smooth) / (union + self.smooth)
+
+    def forward(self, preds, targets):
+        bce_loss = self.bce(preds, targets)
+        dice_loss = self.dice_loss(preds, targets)
+        return 0.5 * bce_loss + 0.5 * dice_loss
+
+# --- Metrics ---
+def compute_metrics(preds, targets, threshold=0.5):
+    preds = torch.sigmoid(preds)
+    preds_bin = (preds > threshold).float()
+    targets_bin = (targets > 0.5).float()
+
+    preds_flat = preds_bin.view(-1).cpu().numpy()
+    targets_flat = targets_bin.view(-1).cpu().numpy()
+    
+    # Confusion matrix
+    tn, fp, fn, tp = confusion_matrix(targets_flat, preds_flat, labels=[0, 1]).ravel()
+    
+    # Sklearn metrics
+    precision, recall, f1, _ = precision_recall_fscore_support(targets_flat, preds_flat, average='binary', zero_division=0)
+    accuracy = (tp + tn) / (tp + tn + fp + fn)
+    
+    # AUC
+    auc = roc_auc_score(targets_flat, preds.view(-1).cpu().numpy()) if targets_flat.sum() > 0 else 0.0
+    
+    # Dice and IoU
+    intersection = (preds_bin * targets_bin).sum().item()
+    union = preds_bin.sum().item() + targets_bin.sum().item()
+    dice = (2.0 * intersection + 1e-6) / (union + 1e-6)
+    iou = (intersection + 1e-6) / (union - intersection + 1e-6)
+    
+    return {
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1,
+        'auc': auc,
+        'dice': dice,
+        'iou': iou,
+        'tp': tp,
+        'tn': tn,
+        'fp': fp,
+        'fn': fn
+    }
+
+# --- Test-Time Augmentation ---
+def tta_predict(model, img, device):
+    transforms = [
+        lambda x: x,
+        lambda x: torch.flip(x, dims=[2]),  # Horizontal flip
+        lambda x: torch.flip(x, dims=[3]),  # Vertical flip
+        lambda x: torch.rot90(x, k=1, dims=[2, 3]),  # 90-degree rotation
+    ]
+    preds = []
+    model.eval()
+    with torch.no_grad():
+        for t in transforms:
+            img_t = t(img)
+            with autocast('cuda', enabled=torch.cuda.is_available()):
+                pred = torch.sigmoid(model(img_t))
+            # Reverse transform
+            if t == transforms[1]:
+                pred = torch.flip(pred, dims=[2])
+            elif t == transforms[2]:
+                pred = torch.flip(pred, dims=[3])
+            elif t == transforms[3]:
+                pred = torch.rot90(pred, k=-1, dims=[2, 3])
+            preds.append(pred)
+    return torch.mean(torch.stack(preds), dim=0)
+
+# --- Prepare Data Splits ---
+all_images = sorted([f for f in os.listdir(image_dir) if f.endswith(('.jpg', '.png', '.JPG', '.PNG'))])
+all_masks = sorted([f for f in os.listdir(mask_dir) if f.endswith(('.jpg', '.png', '.JPG', '.PNG'))])
+
+assert len(all_images) == len(all_masks), f"Number of images ({len(all_images)}) and masks ({len(all_masks)}) don't match"
+for img, mask in zip(all_images, all_masks):
+    assert os.path.splitext(img)[0] == os.path.splitext(mask)[0], f"Mismatch: {img} vs {mask}"
+
+random.seed(42)
+random.shuffle(all_images)
+
+total = len(all_images)
+train_split = int(0.8 * total)
+val_split = int(0.1 * total)
+
+def get_paths(filenames):
+    return [os.path.join(image_dir, f) for f in filenames], \
+           [os.path.join(mask_dir, f) for f in filenames]
+
+train_imgs, train_masks = get_paths(all_images[:train_split])
+val_imgs, val_masks = get_paths(all_images[train_split:train_split + val_split])
+test_imgs, test_masks = get_paths(all_images[train_split + val_split:])
+
+# --- Data Loaders ---
+train_dataset = PolypDataset(train_imgs, train_masks, augment=True)
+val_dataset = PolypDataset(val_imgs, val_masks, augment=False)
+test_dataset = PolypDataset(test_imgs, test_masks, augment=False)
+
+train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=2, pin_memory=True)
+val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False, num_workers=2, pin_memory=True)
+test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False, num_workers=2, pin_memory=True)
+
+# --- Training Setup ---
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = PraNet().to(device)
+try:
+    model = torch.compile(model, mode="reduce-overhead")
+except AttributeError:
+    print("torch.compile not supported, proceeding without compilation")
+criterion = CombinedLoss(label_smoothing=0.1)
+optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=2e-2)
+scheduler = CosineAnnealingLR(optimizer, T_max=30, eta_min=1e-6)
+scaler = GradScaler('cuda', enabled=torch.cuda.is_available())
+
+# --- Training Loop ---
+print("\nStarting training...")
+best_val_loss = float('inf')
+patience = 10
+epochs_no_improve = 0
+for epoch in range(30):
+    model.train()
+    total_loss = 0.0
+    
+    try:
+        for imgs, masks in train_loader:
+            imgs, masks = imgs.to(device), masks.to(device)
+            
+            optimizer.zero_grad(set_to_none=True)
+            with autocast('cuda', enabled=torch.cuda.is_available()):
+                preds = model(imgs)
+                loss = criterion(preds, masks)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            
+            total_loss += loss.item()
+    except Exception as e:
+        print(f"Error in training loop: {e}")
+        continue
+    
+    # Validation
+    model.eval()
+    val_loss = 0.0
+    val_metrics = {'accuracy': 0.0, 'precision': 0.0, 'recall': 0.0, 'f1': 0.0, 'auc': 0.0, 'dice': 0.0, 'iou': 0.0}
+    with torch.no_grad():
+        for imgs, masks in val_loader:
+            imgs, masks = imgs.to(device), masks.to(device)
+            with autocast('cuda', enabled=torch.cuda.is_available()):
+                preds = model(imgs)
+                loss = criterion(preds, masks)
+            val_loss += loss.item()
+            metrics = compute_metrics(preds, masks)
+            for k in val_metrics:
+                val_metrics[k] += metrics[k]
+    
+    val_loss /= len(val_loader)
+    for k in val_metrics:
+        val_metrics[k] /= len(val_loader)
+    scheduler.step()
+    
+    print(f"Epoch {epoch+1}/30 - Train Loss: {total_loss/len(train_loader):.4f} - "
+          f"Val Loss: {val_loss:.4f} - Val Dice: {val_metrics['dice']:.4f} - Val IoU: {val_metrics['iou']:.4f} - "
+          f"Val Acc: {val_metrics['accuracy']:.4f} - Val Prec: {val_metrics['precision']:.4f} - "
+          f"Val Rec: {val_metrics['recall']:.4f} - Val F1: {val_metrics['f1']:.4f} - Val AUC: {val_metrics['auc']:.4f}")
+    
+    # Early stopping and model saving
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        epochs_no_improve = 0
+        try:
+            torch.save(model.state_dict(), 'best_pranet.pth')
+        except Exception as e:
+            print(f"Failed to save model: {e}")
+    else:
+        epochs_no_improve += 1
+        if epochs_no_improve >= patience:
+            print(f"Early stopping at epoch {epoch+1}")
+            break
+
+# --- Evaluation with TTA ---
+try:
+    model.load_state_dict(torch.load('best_pranet.pth', map_location=device))
+except FileNotFoundError:
+    print("Best model not found, using final model for evaluation")
+model.eval()
+test_metrics = {'accuracy': 0.0, 'precision': 0.0, 'recall': 0.0, 'f1': 0.0, 'auc': 0.0, 'dice': 0.0, 'iou': 0.0, 'tp': 0, 'tn': 0, 'fp': 0, 'fn': 0}
+num_samples = 0
+
+# Find optimal threshold
+thresholds = np.arange(0.1, 0.9, 0.1)
+best_f1 = 0.0
+best_threshold = 0.5
+with torch.no_grad():
+    for imgs, masks in val_loader:
+        imgs, masks = imgs.to(device), masks.to(device)
+        preds = tta_predict(model, imgs, device)
+        for t in thresholds:
+            metrics = compute_metrics(preds, masks, threshold=t)
+            if metrics['f1'] > best_f1:
+                best_f1 = metrics['f1']
+                best_threshold = t
+
+print(f"Optimal threshold: {best_threshold:.2f}")
+
+# Test evaluation
+with torch.no_grad():
+    for imgs, masks in test_loader:
+        imgs, masks = imgs.to(device), masks.to(device)
+        preds = tta_predict(model, imgs, device)
+        metrics = compute_metrics(preds, masks, threshold=best_threshold)
+        num_samples += imgs.size(0)
+        for k in test_metrics:
+            test_metrics[k] += metrics[k] * imgs.size(0)
+    
+for k in test_metrics:
+    test_metrics[k] /= num_samples
+
+print("\nTest Metrics:")
+print(f"Accuracy: {test_metrics['accuracy']:.4f}")
+print(f"Precision: {test_metrics['precision']:.4f}")
+print(f"Recall: {test_metrics['recall']:.4f}")
+print(f"F1 Score: {test_metrics['f1']:.4f}")
+print(f"AUC: {test_metrics['auc']:.4f}")
+print(f"Dice Coefficient: {test_metrics['dice']:.4f}")
+print(f"IoU: {test_metrics['iou']:.4f}")
+print(f"True Positives: {int(test_metrics['tp'])}")
+print(f"True Negatives: {int(test_metrics['tn'])}")
+print(f"False Positives: {int(test_metrics['fp'])}")
+print(f"False Negatives: {int(test_metrics['fn'])}")
+
+# Visualize first 2 samples
+with torch.no_grad():
+    for imgs, masks in test_loader:
+        imgs, masks = imgs.to(device), masks.to(device)
+        preds = tta_predict(model, imgs, device)
+        preds_bin = (preds > best_threshold).float()
+
+        for i in range(min(2, imgs.size(0))):
+            plt.figure(figsize=(12, 4))
+            img_np = imgs[i].cpu().permute(1, 2, 0).numpy() * np.array([0.229, 0.224, 0.225]) + np.array([0.485, 0.456, 0.406])
+            img_np = np.clip(img_np, 0, 1)
+
+            plt.subplot(1, 3, 1)
+            plt.imshow(img_np)
+            plt.title("Image")
+            plt.axis("off")
+
+            plt.subplot(1, 3, 2)
+            plt.imshow(masks[i].cpu().squeeze(), cmap='gray')
+            plt.title("Ground Truth")
+            plt.axis("off")
+
+            plt.subplot(1, 3, 3)
+            plt.imshow(preds_bin[i].cpu().squeeze(), cmap='gray')
+            plt.title("Prediction")
+            plt.axis("off")
+
+            plt.savefig(f'evaluation_{i}.png', bbox_inches='tight')
+            plt.close()
+        break
+
+print("Training and evaluation completed!")
